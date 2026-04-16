@@ -198,7 +198,8 @@ async def _cmd_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Напиши задачу: `/prompt добавь валидацию в форму`", parse_mode="Markdown")
         return
 
-    await update.message.reply_text(f"⏳ Отправляю задачу Claude...\n\n_{text}_", parse_mode="Markdown")
+    # Без parse_mode — пользовательский текст может содержать спецсимволы Markdown
+    await update.message.reply_text(f"⏳ Отправляю задачу Claude...\n\n{text}")
 
     try:
         # --continue продолжает последнюю сессию (сохраняет контекст разговора)
@@ -222,10 +223,7 @@ async def _cmd_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if len(output) > 3800:
             output = output[:3800] + "\n\n…(обрезано)"
 
-        await update.message.reply_text(
-            f"✅ *Готово*\n\n```\n{output}\n```",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text(f"✅ Готово\n\n{output}")
 
     except asyncio.TimeoutError:
         await update.message.reply_text("⏰ Таймаут 5 минут — Claude не ответил")
