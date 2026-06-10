@@ -1,31 +1,24 @@
 """
-Claude Code PostToolUse hook — шлёт результат выполненного действия в Telegram.
+Claude Code PostToolUse hook — forwards tool call results to Telegram.
 
-После того как Claude выполнил Bash/Write/Edit/Agent — отправляем краткий итог
-чтобы пользователь видел что реально произошло (паттерн verbose output).
+After Claude executed a Bash/Write/Edit/Agent call, send a short summary
+so you can see what actually happened from your phone.
 
-Настройка в ~/.claude/settings.json:
-{
-  "hooks": {
-    "PostToolUse": [{
-      "matcher": "Bash|Write|Edit|Agent",
-      "command": "python D:/vsc/f/tg_approver/hook_post.py"
-    }]
-  }
-}
+Register in ~/.claude/settings.json — see README.
 """
 import io
 import json
+import os
 import sys
 import urllib.request
 
-# UTF-8 на Windows
-sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8")
-
-SERVER = "http://127.0.0.1:8877"
+SERVER = os.environ.get("TG_APPROVER_SERVER", "http://127.0.0.1:8877")
 
 
 def main():
+    if os.name == "nt":
+        sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8")
+
     raw = sys.stdin.read().strip()
     if not raw:
         return
@@ -37,13 +30,13 @@ def main():
 
     tool_name  = data.get("tool_name", "")
     tool_input = data.get("tool_input", {})
-    # Результат может быть строкой или структурой
-    tool_result = data.get("tool_result", "")
+    # Newer Claude Code versions send tool_response, older ones tool_result;
+    # either may be a plain string or a structure
+    tool_result = data.get("tool_response", data.get("tool_result", ""))
     if isinstance(tool_result, dict):
-        # Берём текстовое содержимое если есть
         tool_result = tool_result.get("output") or tool_result.get("content") or str(tool_result)
 
-    # Отправляем только если сервер запущен — не блокируем если нет
+    # Only notify if the server is up — never block the session
     try:
         body = json.dumps({
             "tool_name":  tool_name,
@@ -56,7 +49,7 @@ def main():
         )
         urllib.request.urlopen(req, timeout=3)
     except Exception:
-        pass  # Сервер не запущен — молча пропускаем
+        pass  # server down — silently skip
 
 
 if __name__ == "__main__":

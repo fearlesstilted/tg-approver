@@ -1,37 +1,34 @@
 """
-Claude Code PreToolUse hook — шлёт tool call в Telegram для аппрува.
-Одновременно ждёт ответа с двух сторон:
-  - Telegram: кнопки ✅ Allow / ❌ Deny
-  - Терминал: Enter = разрешить, Esc = отклонить (если за ПК)
+Claude Code PreToolUse hook — sends tool calls to Telegram for approval.
 
-Настройка в ~/.claude/settings.json:
-{
-  "hooks": {
-    "PreToolUse": [{
-      "matcher": "Bash|Write|Edit|Agent",
-      "command": "python D:/vsc/f/tg_approver/hook.py"
-    }]
-  }
-}
+Waits for a decision from either side:
+  - Telegram: ✅ Allow / ❌ Deny buttons
+  - Terminal: Enter = allow, Esc = deny
+    (Windows: always on; Linux/macOS: opt-in via TG_APPROVER_TTY=1)
+
+If the approval server is not running, the hook stays silent and Claude Code
+falls back to its normal permission prompts.
+
+Register in ~/.claude/settings.json — see README.
 """
 import io
 import json
-import msvcrt   # Windows: неблокирующее чтение клавиатуры
+import os
 import sys
-import time
 import threading
-import uuid
-import urllib.request
+import time
 import urllib.error
+import urllib.request
+import uuid
 
-# UTF-8 на Windows
-sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8")
+SERVER        = os.environ.get("TG_APPROVER_SERVER", "http://127.0.0.1:8877")
+POLL_INTERVAL = 2                                                  # seconds between server checks
+TIMEOUT       = int(os.environ.get("TG_APPROVER_TIMEOUT", "600"))  # max wait, seconds
+# What to do when nobody answered: "ask" → fall back to the terminal prompt,
+# "deny" → reject the tool call.
+ON_TIMEOUT    = os.environ.get("TG_APPROVER_ON_TIMEOUT", "ask")
 
-SERVER        = "http://127.0.0.1:8877"
-POLL_INTERVAL = 2    # секунды между проверками сервера
-TIMEOUT       = 600  # 10 минут максимум
-
-# Инструменты которые всегда безопасны — пропускаем без вопросов
+# Tools that are always safe — pass through without asking
 SAFE_TOOLS = {
     "Read", "Glob", "Grep", "LS",
     "WebFetch", "WebSearch",
@@ -41,7 +38,7 @@ SAFE_TOOLS = {
     "ListMcpResourcesTool", "ReadMcpResourceTool",
 }
 
-# Bash команды read-only — пропускаем
+# Read-only Bash commands — pass through
 SAFE_BASH_PREFIXES = (
     "git log", "git status", "git diff", "git show", "git branch",
     "python -m pytest", "pytest ",
@@ -52,12 +49,20 @@ SAFE_BASH_PREFIXES = (
 )
 
 
-def _deny(reason: str):
-    print(json.dumps({"decision": "block", "reason": reason}))
-    sys.exit(2)
+def _decision(decision: str, reason: str):
+    """Emit a PreToolUse permission decision: allow | deny | ask."""
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": reason,
+        }
+    }))
+    sys.exit(0)
 
 
-def _allow():
+def _passthrough():
+    """No opinion — Claude Code's normal permission flow applies."""
     sys.exit(0)
 
 
@@ -78,61 +83,95 @@ def _get(path: str) -> dict:
 
 def _keyboard_listener(decision: list):
     """
-    Слушает клавиатуру в отдельном потоке пока ждём ответа из Telegram.
-    Enter → approve, Esc → deny.
-    Это даёт возможность аппрувить прямо из терминала если за ПК.
+    Listen for terminal keys in a background thread while waiting for Telegram.
+    Enter → approve, Esc → deny. Lets you answer locally when you are at the PC.
     """
-    while decision[0] is None:
-        try:
-            if msvcrt.kbhit():
-                key = msvcrt.getch()
-                if key in (b'\r', b'\n'):      # Enter
+    if os.name == "nt":
+        import msvcrt
+        while decision[0] is None:
+            try:
+                if msvcrt.kbhit():
+                    key = msvcrt.getch()
+                    if key in (b"\r", b"\n"):      # Enter
+                        decision[0] = "approved"
+                        return
+                    elif key == b"\x1b":           # Esc
+                        decision[0] = "denied"
+                        return
+            except Exception:
+                pass
+            time.sleep(0.05)
+        return
+
+    # POSIX: reading /dev/tty competes with the Claude Code TUI for input,
+    # so it is opt-in. Telegram buttons always work either way.
+    if os.environ.get("TG_APPROVER_TTY") != "1":
+        return
+    try:
+        import select
+        import termios
+        import tty
+        fd = os.open("/dev/tty", os.O_RDONLY)
+    except Exception:
+        return
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while decision[0] is None:
+            r, _, _ = select.select([fd], [], [], 0.1)
+            if r:
+                key = os.read(fd, 1)
+                if key in (b"\r", b"\n"):
                     decision[0] = "approved"
                     return
-                elif key == b'\x1b':           # Esc
+                if key == b"\x1b":
                     decision[0] = "denied"
                     return
-        except Exception:
-            pass
-        time.sleep(0.05)
+    except Exception:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        os.close(fd)
 
 
 def main():
+    if os.name == "nt":
+        sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8")
+
     raw = sys.stdin.read().strip()
     if not raw:
-        _allow()
+        _passthrough()
 
     try:
         data = json.loads(raw)
     except Exception:
-        _allow()
+        _passthrough()
 
     tool_name  = data.get("tool_name", "")
     tool_input = data.get("tool_input", {})
     session_id = data.get("session_id", "")
 
-    # 1. Пропускаем безопасные инструменты
+    # 1. Safe tools pass without asking
     if tool_name in SAFE_TOOLS:
-        _allow()
+        _decision("allow", "Read-only tool")
 
-    # 2. Пропускаем безопасные Bash команды
+    # 2. Safe read-only Bash commands pass too
     if tool_name == "Bash":
         cmd = tool_input.get("command", "").strip()
         if any(cmd.startswith(p) for p in SAFE_BASH_PREFIXES):
-            _allow()
+            _decision("allow", "Read-only command")
 
-    # 3. Проверяем что сервер запущен
+    # 3. Server must be up, otherwise stay out of the way
     try:
         _get("/health")
     except Exception:
-        # Сервер не запущен — пропускаем с предупреждением
         sys.stderr.write(
-            "[tg-approver] ⚠️  Сервер не запущен на 8877 — авто-разрешение.\n"
-            "[tg-approver]    Запусти: python D:/vsc/f/tg_approver/server.py\n"
+            "[tg-approver] ⚠️  Server not running on "
+            f"{SERVER} — normal permission prompts apply.\n"
         )
-        _allow()
+        _passthrough()
 
-    # 4. Отправляем запрос на аппрув в Telegram
+    # 4. Send the approval request to Telegram
     request_id = str(uuid.uuid4())[:8]
     try:
         _post("/pending", {
@@ -143,46 +182,47 @@ def main():
         })
     except Exception as e:
         sys.stderr.write(f"[tg-approver] POST failed: {e}\n")
-        _allow()
+        _passthrough()
 
-    # 5. Ждём ответа — из Telegram ИЛИ с клавиатуры терминала
+    # 5. Wait for an answer — Telegram OR terminal keys
     sys.stderr.write(
-        f"[tg-approver] ⏳ [{request_id}] Ожидание... "
-        f"(Enter=разрешить, Esc=отклонить, или ответь в Telegram)\n"
+        f"[tg-approver] ⏳ [{request_id}] Waiting... "
+        f"(answer in Telegram{' or Enter/Esc here' if os.name == 'nt' else ''})\n"
     )
 
-    # Запускаем слушатель клавиатуры в отдельном потоке
-    local_decision: list = [None]  # список вместо переменной — мутабельно из потока
+    local_decision: list = [None]  # list instead of a var — mutable from the thread
     kb_thread = threading.Thread(target=_keyboard_listener, args=(local_decision,), daemon=True)
     kb_thread.start()
 
     elapsed = 0
     while elapsed < TIMEOUT:
-        # Сначала проверяем локальное решение (терминал быстрее)
+        # Local decision first (faster than polling)
         if local_decision[0] == "approved":
-            sys.stderr.write(f"[tg-approver] ✅ Разрешено с терминала [{request_id}]\n")
-            _allow()
+            sys.stderr.write(f"[tg-approver] ✅ Allowed from terminal [{request_id}]\n")
+            _decision("allow", "Approved from terminal")
         elif local_decision[0] == "denied":
-            sys.stderr.write(f"[tg-approver] ❌ Отклонено с терминала [{request_id}]\n")
-            _deny("Отклонено с терминала")
+            sys.stderr.write(f"[tg-approver] ❌ Denied from terminal [{request_id}]\n")
+            _decision("deny", "Denied from terminal")
 
-        # Затем проверяем Telegram
+        # Then Telegram
         try:
             resp   = _get(f"/decision/{request_id}")
             status = resp.get("status")
             if status == "approved":
-                sys.stderr.write(f"[tg-approver] ✅ Разрешено из Telegram [{request_id}]\n")
-                _allow()
+                sys.stderr.write(f"[tg-approver] ✅ Allowed from Telegram [{request_id}]\n")
+                _decision("allow", "Approved via Telegram")
             elif status == "denied":
-                sys.stderr.write(f"[tg-approver] ❌ Отклонено из Telegram [{request_id}]\n")
-                _deny("Отклонено из Telegram")
+                sys.stderr.write(f"[tg-approver] ❌ Denied from Telegram [{request_id}]\n")
+                _decision("deny", "Denied via Telegram")
         except Exception:
             pass
 
         time.sleep(POLL_INTERVAL)
         elapsed += POLL_INTERVAL
 
-    _deny(f"Таймаут: нет ответа за {TIMEOUT // 60} минут")
+    if ON_TIMEOUT == "deny":
+        _decision("deny", f"No answer within {TIMEOUT // 60} minutes")
+    _decision("ask", f"No Telegram answer within {TIMEOUT // 60} minutes — ask in terminal")
 
 
 if __name__ == "__main__":
